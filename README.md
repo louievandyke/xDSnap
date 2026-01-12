@@ -38,7 +38,7 @@ xDSnap is a CLI tool to capture and organize Envoy configuration snapshots from 
 ### From Source
 
 ```bash
-git clone https://github.com/markcampv/xDSnap.git
+git clone https://github.com/louievandyke/xDSnap.git
 cd xDSnap
 go build -o xdsnap ./cmd/
 ```
