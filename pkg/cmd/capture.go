@@ -1,23 +1,19 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"time"
 
-	"github.com/markcampv/xDSnap/kube"
+	"github.com/markcampv/xDSnap/nomad"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 )
 
-func NewCaptureCommand(streams genericclioptions.IOStreams) *cobra.Command {
-	var podName, containerName, namespace string
+func NewCaptureCommand(streams IOStreams) *cobra.Command {
+	var allocID, taskName, namespace, serviceName string
 	var endpoints []string
 	var outputDir string
 	var interval, duration, repeat int
@@ -31,53 +27,60 @@ func NewCaptureCommand(streams genericclioptions.IOStreams) *cobra.Command {
 
 	captureCmd := &cobra.Command{
 		Use:   "capture",
-		Short: "Capture Envoy snapshots from a Consul service mesh",
+		Short: "Capture Envoy snapshots from a Consul Connect service mesh on Nomad",
+		Long: `Capture Envoy configuration snapshots from Consul Connect sidecars running on Nomad.
+
+This tool discovers Consul Connect allocations and captures:
+- Envoy configuration dumps (/config_dump, /stats, /listeners, /clusters, /certs)
+- Task logs (application and sidecar)
+- Optional tcpdump packet captures
+
+Environment variables:
+  NOMAD_ADDR         Nomad API address (default: http://127.0.0.1:4646)
+  NOMAD_TOKEN        Nomad ACL token (optional)
+  CONSUL_HTTP_ADDR   Consul API address (default: http://127.0.0.1:8500)
+  CONSUL_HTTP_TOKEN  Consul ACL token (optional)`,
 		Run: func(cmd *cobra.Command, args []string) {
-			if containerName == "consul-dataplane" {
-				log.Fatal("Error: 'consul-dataplane' cannot be used as the --container value. Please specify the application container instead.")
-			}
-
-			config, err := rest.InClusterConfig()
+			// Create Nomad API service
+			nomadService, err := nomad.NewNomadApiServiceFromEnv(namespace)
 			if err != nil {
-				log.Printf("Could not use in-cluster config, falling back to kubeconfig: %v", err)
-				configFlags := genericclioptions.NewConfigFlags(true)
-				kubeconfig := os.Getenv("KUBECONFIG")
-				configFlags.KubeConfig = &kubeconfig
-				restConfig, err := configFlags.ToRESTConfig()
+				log.Fatalf("Error creating Nomad client: %v", err)
+			}
+
+			// Determine which allocations to capture
+			var allocsToCapture []nomad.AllocationInfo
+
+			if allocID != "" {
+				// Single allocation specified
+				allocInfo, err := nomadService.GetAllocation(allocID)
 				if err != nil {
-					log.Fatalf("Error creating Kubernetes client config: %v", err)
+					log.Fatalf("Error getting allocation %s: %v", allocID, err)
 				}
-				config = restConfig
-			}
-
-			clientset, err := kubernetes.NewForConfig(config)
-			if err != nil {
-				log.Fatalf("Error creating Kubernetes client: %v", err)
-			}
-
-			if namespace == "" {
-				namespace = "default"
-			}
-
-			kubeService := kube.NewKubernetesApiService(clientset, config, namespace)
-
-			var podsToCapture []string
-			if podName == "" {
-				pods, err := clientset.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{})
+				allocsToCapture = append(allocsToCapture, *allocInfo)
+			} else if serviceName != "" {
+				// Discover by service name
+				allocs, err := nomadService.FindConnectAllocationsByService(namespace, serviceName)
 				if err != nil {
-					log.Fatalf("Error listing pods: %v", err)
+					log.Fatalf("Error discovering allocations for service %s: %v", serviceName, err)
 				}
-				for _, pod := range pods.Items {
-					if pod.Annotations["consul.hashicorp.com/connect-inject"] == "true" {
-						podsToCapture = append(podsToCapture, pod.Name)
-					}
-				}
-				if len(podsToCapture) == 0 {
-					log.Println("No pods found with the annotation consul.hashicorp.com/connect-inject=true")
-					return
-				}
+				allocsToCapture = allocs
 			} else {
-				podsToCapture = append(podsToCapture, podName)
+				// Discover all Connect allocations
+				allocs, err := nomadService.FindConnectAllocations(namespace)
+				if err != nil {
+					log.Fatalf("Error discovering Connect allocations: %v", err)
+				}
+				allocsToCapture = allocs
+			}
+
+			if len(allocsToCapture) == 0 {
+				log.Println("No Consul Connect allocations found")
+				return
+			}
+
+			log.Printf("Found %d allocation(s) to capture", len(allocsToCapture))
+			for _, alloc := range allocsToCapture {
+				log.Printf("  - %s (job: %s, group: %s, sidecar: %s)", alloc.ID[:8], alloc.JobID, alloc.TaskGroup, alloc.SidecarTask)
 			}
 
 			if interval < 5 {
@@ -115,54 +118,56 @@ func NewCaptureCommand(streams genericclioptions.IOStreams) *cobra.Command {
 					continue
 				}
 
-				for _, pod := range podsToCapture {
-					containers, err := kubeService.ListContainers(pod)
-					if err != nil {
-						log.Printf("Failed to list containers for pod %s: %v", pod, err)
-						continue
-					}
-
-					sidecar := ""
-					for _, c := range containers {
-						if c == "consul-dataplane" || c == "envoy-sidecar" || c == "mesh-gateway" || c == "api-gateway" {
-							sidecar = c
-							break
+				for _, alloc := range allocsToCapture {
+					// Determine which task to use
+					targetTask := taskName
+					if targetTask == "" {
+						// Use detected sidecar or first non-sidecar task
+						if alloc.SidecarTask != "" {
+							// Find a non-sidecar task for the application logs
+							for _, t := range alloc.Tasks {
+								if t != alloc.SidecarTask {
+									targetTask = t
+									break
+								}
+							}
+						}
+						if targetTask == "" && len(alloc.Tasks) > 0 {
+							targetTask = alloc.Tasks[0]
 						}
 					}
-					if sidecar == "" {
-						log.Printf("No known Envoy sidecar found in pod %s", pod)
+
+					if alloc.SidecarTask == "" {
+						log.Printf("No sidecar task found in allocation %s, skipping", alloc.ID[:8])
 						continue
 					}
 
 					finalReset := repeat == 0 || captures == repeat-1
 
-					log.Printf("Calling CaptureSnapshot -> pod: %s | container: %s | enableTrace: %v | tcpdump: %v | extraLogs: [%s] | finalReset: %v",
-						pod, containerName, enableTrace, tcpdumpEnabled, sidecar, finalReset)
+					log.Printf("Capturing allocation: %s | task: %s | sidecar: %s | trace: %v | tcpdump: %v",
+						alloc.ID[:8], targetTask, alloc.SidecarTask, enableTrace, tcpdumpEnabled)
 
 					snapshotConfig := SnapshotConfig{
-						PodName: pod,
-						// Use CLI flag if provided, otherwise use detected sidecar
-						ContainerName: func() string {
-							if containerName != "" {
-								return containerName
-							}
-							return sidecar
-						}(),
+						AllocID:           alloc.ID,
+						AllocIP:           alloc.IP,
+						TaskName:          targetTask,
+						SidecarTask:       alloc.SidecarTask,
 						Endpoints:         endpoints,
 						OutputDir:         snapshotDir,
-						ExtraLogs:         []string{sidecar},
+						ExtraLogs:         []string{alloc.SidecarTask},
 						EnableTrace:       enableTrace,
 						TcpdumpEnabled:    tcpdumpEnabled,
 						Duration:          time.Duration(duration) * time.Second,
 						SkipLogLevelReset: !finalReset,
 					}
+
 					// Start timer here *after* setup begins
 					if repeat == 0 && duration > 0 && startTime.IsZero() {
 						startTime = time.Now()
 					}
 
-					if err := CaptureSnapshot(kubeService, snapshotConfig); err != nil {
-						log.Printf("Error capturing snapshot for pod %s: %v", pod, err)
+					if err := CaptureSnapshot(nomadService, snapshotConfig); err != nil {
+						log.Printf("Error capturing snapshot for allocation %s: %v", alloc.ID[:8], err)
 					}
 				}
 
@@ -178,19 +183,39 @@ func NewCaptureCommand(streams genericclioptions.IOStreams) *cobra.Command {
 		},
 	}
 
-	captureCmd.Flags().StringVar(&podName, "pod", "", "Pod name (optional; defaults to all pods with connect-inject=true)")
-	captureCmd.Flags().StringVar(&containerName, "container", "", "Name of the application container")
+	// Nomad-specific flags
+	captureCmd.Flags().StringVar(&allocID, "alloc", "", "Allocation ID (optional; defaults to all Connect allocations)")
+	captureCmd.Flags().StringVar(&taskName, "task", "", "Task name for application logs (auto-detected if not specified)")
+	captureCmd.Flags().StringVar(&serviceName, "service", "", "Consul service name to filter allocations")
+	captureCmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Nomad namespace (optional)")
+
+	// Capture options
 	captureCmd.Flags().StringSliceVar(&endpoints, "endpoints", []string{}, "Envoy endpoints to capture")
 	captureCmd.Flags().StringVar(&outputDir, "output-dir", outputDir, "Directory to save snapshots")
-	captureCmd.Flags().StringVarP(&namespace, "namespace", "n", "", "Target namespace (optional)")
 	captureCmd.Flags().IntVar(&interval, "sleep", 5, "Sleep duration between captures in seconds (minimum 5s)")
 	captureCmd.Flags().IntVar(&duration, "duration", 60, "Total capture duration in seconds")
 	captureCmd.Flags().IntVar(&repeat, "repeat", 0, "Number of snapshot repetitions (takes precedence over duration)")
 	captureCmd.Flags().BoolVar(&enableTrace, "enable-trace", false, "Enable Envoy trace log level")
-	captureCmd.Flags().BoolVar(&tcpdumpEnabled, "tcpdump", false, "Enable tcpdump capture (runs once if enabled)")
+	captureCmd.Flags().BoolVar(&tcpdumpEnabled, "tcpdump", false, "Enable tcpdump capture (requires tcpdump in sidecar image)")
 
-	_ = viper.BindEnv("namespace", "KUBECTL_PLUGINS_CURRENT_NAMESPACE")
+	_ = viper.BindEnv("namespace", "NOMAD_NAMESPACE")
 	_ = viper.BindPFlag("namespace", captureCmd.Flags().Lookup("namespace"))
 
 	return captureCmd
+}
+
+// IOStreams provides standard I/O streams
+type IOStreams struct {
+	In     io.Reader
+	Out    io.Writer
+	ErrOut io.Writer
+}
+
+// NewIOStreams returns IOStreams using os.Stdin, os.Stdout, os.Stderr
+func NewIOStreams() IOStreams {
+	return IOStreams{
+		In:     os.Stdin,
+		Out:    os.Stdout,
+		ErrOut: os.Stderr,
+	}
 }

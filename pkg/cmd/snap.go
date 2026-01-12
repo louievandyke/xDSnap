@@ -15,12 +15,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/markcampv/xDSnap/kube"
+	"github.com/markcampv/xDSnap/nomad"
 )
 
 type SnapshotConfig struct {
-	PodName           string
-	ContainerName     string
+	AllocID           string
+	AllocIP           string
+	TaskName          string
+	SidecarTask       string
 	Endpoints         []string
 	OutputDir         string
 	ExtraLogs         []string
@@ -32,141 +34,114 @@ type SnapshotConfig struct {
 
 var DefaultEndpoints = []string{"/stats", "/config_dump", "/listeners", "/clusters", "/certs"}
 
-func CaptureSnapshot(kubeService kube.KubernetesApiService, config SnapshotConfig) error {
+func CaptureSnapshot(nomadService nomad.NomadApiService, config SnapshotConfig) error {
 	if len(config.Endpoints) == 0 {
 		config.Endpoints = DefaultEndpoints
 	}
 
-	log.Printf("CaptureSnapshot called with Pod=%s Container=%s EnableTrace=%v", config.PodName, config.ContainerName, config.EnableTrace)
+	log.Printf("CaptureSnapshot called with Alloc=%s Task=%s Sidecar=%s EnableTrace=%v",
+		config.AllocID[:8], config.TaskName, config.SidecarTask, config.EnableTrace)
 
-	tempDir, err := os.MkdirTemp("", config.PodName)
+	tempDir, err := os.MkdirTemp("", config.AllocID[:8])
 	if err != nil {
 		return fmt.Errorf("failed to create temporary directory: %w", err)
 	}
 	defer os.RemoveAll(tempDir)
 
-	// Stream logs from app container + any extras (e.g., envoy-sidecar / consul-dataplane)
+	// Stream logs from app task + any extras (e.g., sidecar)
 	logResults := make(chan struct{}, len(config.ExtraLogs)+1)
-	for _, c := range append([]string{config.ContainerName}, config.ExtraLogs...) {
-		if c == "" {
+
+	// Collect unique tasks to get logs from
+	tasksToLog := []string{config.TaskName}
+	for _, t := range config.ExtraLogs {
+		if t != "" && t != config.TaskName {
+			tasksToLog = append(tasksToLog, t)
+		}
+	}
+
+	for _, task := range tasksToLog {
+		if task == "" {
 			logResults <- struct{}{}
 			continue
 		}
-		c := c
+		task := task
 		go func() {
-			log.Printf("Starting log stream for container %s", c)
-			logBytes, err := streamLogsWithTimeout(kubeService, config.PodName, c, config.Duration+10*time.Second)
+			log.Printf("Starting log stream for task %s", task)
+			logBytes, err := streamLogsWithTimeout(nomadService, config.AllocID, task, config.Duration+10*time.Second)
 			if err != nil {
-				log.Printf("Failed to stream logs for container %s: %v", c, err)
+				log.Printf("Failed to stream logs for task %s: %v", task, err)
 			} else {
-				logsPath := filepath.Join(tempDir, fmt.Sprintf("%s-logs.txt", c))
+				logsPath := filepath.Join(tempDir, fmt.Sprintf("%s-logs.txt", task))
 				if err := os.WriteFile(logsPath, logBytes, 0644); err != nil {
-					log.Printf("Failed to write logs for container %s: %v", c, err)
+					log.Printf("Failed to write logs for task %s: %v", task, err)
 				}
 			}
 			logResults <- struct{}{}
 		}()
 	}
 
-	// --- Set Envoy log level via EPHEMERAL container (no docker.sock) ---
+	// --- Set Envoy log level via exec ---
 	logLevel := "debug"
 	if config.EnableTrace {
 		logLevel = "trace"
 	}
-	log.Printf("Setting Envoy log level to '%s' via ephemeral container", logLevel)
-	curlURL := fmt.Sprintf("http://127.0.0.1:19000/logging?level=%s", logLevel)
-	if err := kubeService.RunEphemeralInTargetNetNS(
-		config.PodName,
-		config.ContainerName, // any container in the pod shares the netns
-		[]string{"sh", "-c", "curl -s -X POST " + curlURL}, // simple POST to admin /logging
-		false,
-		30*time.Second,
-	); err != nil {
+	log.Printf("Setting Envoy log level to '%s' via nomad exec", logLevel)
+
+	if err := setEnvoyLogLevel(nomadService, config, logLevel); err != nil {
 		log.Printf("Failed to set log level: %v", err)
 	}
 
-	// --- Optional tcpdump capture (runtime-agnostic; streams base64 via logs) ---
+	// --- Optional tcpdump capture ---
 	if config.TcpdumpEnabled {
-		log.Printf("Starting tcpdump via ephemeral container (streaming to logs)...")
-		ephemName, err := kubeService.CreateConcurrentTcpdumpCapturePod(
-			config.PodName,
-			[]string{config.ContainerName, "envoy-sidecar", "consul-dataplane"},
-			config.Duration,
-		)
+		log.Printf("Starting tcpdump capture...")
+		pcapData, err := captureTcpdump(nomadService, config)
 		if err != nil {
-			log.Printf("Failed to start tcpdump: %v", err)
-		} else {
-			// The ephemeral container completed; fetch its (base64) logs and decode to a .pcap
-			var logsBuf bytes.Buffer
-			if err := kubeService.FetchContainerLogs(context.Background(), config.PodName, ephemName, false, &logsBuf); err != nil {
-				log.Printf("Failed to fetch tcpdump logs for %s: %v", ephemName, err)
-			} else if logsBuf.Len() == 0 {
-				log.Printf("No tcpdump data found in logs for %s", ephemName)
+			log.Printf("Failed to capture tcpdump: %v", err)
+		} else if len(pcapData) > 0 {
+			pcapPath := filepath.Join(tempDir, "capture.pcap")
+			if err := os.WriteFile(pcapPath, pcapData, 0644); err != nil {
+				log.Printf("Failed to write pcap file: %v", err)
 			} else {
-				// Sanitize and decode base64 safely
-				raw := logsBuf.String()
-				clean := regexp.MustCompile(`[^A-Za-z0-9+/=]`).ReplaceAllString(strings.TrimSpace(raw), "")
-				if clean == "" {
-					log.Printf("No base64 tcpdump data after sanitization")
-				} else {
-					data, decErr := base64.StdEncoding.DecodeString(clean)
-					if decErr != nil {
-						log.Printf("Failed to decode base64 tcpdump stream (raw=%dB, clean=%dB): %v", len(raw), len(clean), decErr)
-					} else {
-						pcapPath := filepath.Join(tempDir, "xdsnap.pcap")
-						if werr := os.WriteFile(pcapPath, data, 0644); werr != nil {
-							log.Printf("Failed to write pcap file: %v", werr)
-						} else {
-							log.Printf("Saved .pcap file: %s", pcapPath)
-						}
-					}
-				}
+				log.Printf("Saved .pcap file: %s", pcapPath)
 			}
 		}
 	}
 
-	// --- Envoy admin endpoints via PORT-FORWARD (with exec fallback inside fetchEnvoyEndpoint) ---
+	// --- Envoy admin endpoints ---
 	for _, endpoint := range config.Endpoints {
-		data, err := fetchEnvoyEndpoint(kubeService, config.PodName, config.ContainerName, endpoint)
+		data, err := fetchEnvoyEndpoint(nomadService, config, endpoint)
 		if err != nil {
 			log.Printf("Error capturing %s: %v", endpoint, err)
 			continue
 		}
 		if len(data) == 0 {
-			log.Printf("Warning: No data received from endpoint %s for pod %s", endpoint, config.PodName)
+			log.Printf("Warning: No data received from endpoint %s for alloc %s", endpoint, config.AllocID[:8])
 			continue
 		}
 		filePath := filepath.Join(tempDir, fmt.Sprintf("%s.json", strings.TrimPrefix(endpoint, "/")))
 		if err := os.WriteFile(filePath, data, 0644); err != nil {
-			log.Panicf("Failed to write data for %s: %v", endpoint, err)
+			log.Printf("Failed to write data for %s: %v", endpoint, err)
 		} else {
-			fmt.Printf("Captured %s for %s and saved to %s\n", endpoint, config.PodName, filePath)
+			fmt.Printf("Captured %s for %s and saved to %s\n", endpoint, config.AllocID[:8], filePath)
 		}
 	}
 
-	// Wait for all log streams to finish flushing
-	for i := 0; i < cap(logResults); i++ {
+	// Wait for all log streams to finish
+	for i := 0; i < len(tasksToLog); i++ {
 		<-logResults
 	}
 
 	// Bundle snapshot
-	tarFilePath := filepath.Join(config.OutputDir, fmt.Sprintf("%s_snapshot.tar.gz", config.PodName))
+	tarFilePath := filepath.Join(config.OutputDir, fmt.Sprintf("%s_snapshot.tar.gz", config.AllocID[:8]))
 	if err := createTarGz(tarFilePath, tempDir); err != nil {
 		return fmt.Errorf("failed to create tar.gz file: %w", err)
 	}
-	fmt.Printf("Snapshot for %s saved as %s\n", config.PodName, tarFilePath)
+	fmt.Printf("Snapshot for %s saved as %s\n", config.AllocID[:8], tarFilePath)
 
-	// Reset log level via EPHEMERAL container
+	// Reset log level
 	if !config.SkipLogLevelReset {
-		resetURL := "http://127.0.0.1:19000/logging?level=info"
-		log.Printf("Resetting Envoy log level back to 'info' on pod: %s", config.PodName)
-		if err := kubeService.RunEphemeralInTargetNetNS(
-			config.PodName,
-			config.ContainerName,
-			[]string{"sh", "-c", "curl -s -X POST " + resetURL},
-			false,
-			30*time.Second,
-		); err != nil {
+		log.Printf("Resetting Envoy log level back to 'info' on alloc: %s", config.AllocID[:8])
+		if err := setEnvoyLogLevel(nomadService, config, "info"); err != nil {
 			log.Printf("Failed to reset log level to info: %v", err)
 		}
 	}
@@ -174,59 +149,126 @@ func CaptureSnapshot(kubeService kube.KubernetesApiService, config SnapshotConfi
 	return nil
 }
 
-func streamLogsWithTimeout(kubeService kube.KubernetesApiService, pod, container string, duration time.Duration) ([]byte, error) {
+func streamLogsWithTimeout(nomadService nomad.NomadApiService, allocID, task string, duration time.Duration) ([]byte, error) {
 	var logsBuf bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
-	done := make(chan error, 1)
+
+	// Stream both stdout and stderr
+	done := make(chan error, 2)
+
 	go func() {
-		done <- kubeService.FetchContainerLogs(ctx, pod, container, true, &logsBuf)
+		done <- nomadService.FetchTaskLogs(ctx, allocID, task, "stdout", true, &logsBuf)
 	}()
 
+	go func() {
+		var stderrBuf bytes.Buffer
+		err := nomadService.FetchTaskLogs(ctx, allocID, task, "stderr", true, &stderrBuf)
+		if err == nil && stderrBuf.Len() > 0 {
+			logsBuf.WriteString("\n--- STDERR ---\n")
+			logsBuf.Write(stderrBuf.Bytes())
+		}
+		done <- err
+	}()
+
+	// Wait for context or completion
 	select {
 	case <-ctx.Done():
 		return logsBuf.Bytes(), nil
 	case err := <-done:
+		// Wait for the second goroutine too
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
 		return logsBuf.Bytes(), err
 	}
 }
 
-func fetchEnvoyEndpoint(kubeService kube.KubernetesApiService, pod, container, endpoint string) ([]byte, error) {
-	const podPort = 19000
-	const maxRetries = 5
+func setEnvoyLogLevel(nomadService nomad.NomadApiService, config SnapshotConfig, level string) error {
+	// Try direct HTTP first if we have an IP
+	if config.AllocIP != "" {
+		path := fmt.Sprintf("/logging?level=%s", level)
+		err := nomadService.EnvoyAdminPOST(config.AllocIP, nomad.EnvoyAdminPort, path)
+		if err == nil {
+			return nil
+		}
+		log.Printf("Direct HTTP failed, falling back to exec: %v", err)
+	}
+
+	// Fallback to exec
+	path := fmt.Sprintf("/logging?level=%s", level)
+	return nomadService.EnvoyAdminPOSTViaExec(config.AllocID, config.SidecarTask, nomad.EnvoyAdminPort, path)
+}
+
+func fetchEnvoyEndpoint(nomadService nomad.NomadApiService, config SnapshotConfig, endpoint string) ([]byte, error) {
+	const maxRetries = 3
 	const retryDelay = 2 * time.Second
 
-	// --- First attempt: port-forward ---
-	for i := 0; i < maxRetries; i++ {
-		b, err := kubeService.PortForwardGET(pod, podPort, endpoint)
-		if err == nil && len(b) > 0 {
-			return b, nil
+	// Try direct HTTP first if we have an IP
+	if config.AllocIP != "" {
+		for i := 0; i < maxRetries; i++ {
+			data, err := nomadService.EnvoyAdminGET(config.AllocIP, nomad.EnvoyAdminPort, endpoint)
+			if err == nil && len(data) > 0 {
+				return data, nil
+			}
+			if i < maxRetries-1 {
+				time.Sleep(retryDelay)
+			}
 		}
-		time.Sleep(retryDelay)
+		log.Printf("Direct HTTP failed for %s, falling back to exec", endpoint)
 	}
 
-	// --- Fallback: ephemeral curl inside pod netns ---
-	var buf bytes.Buffer
-	curlCmd := []string{
+	// Fallback to exec
+	return nomadService.EnvoyAdminGETViaExec(config.AllocID, config.SidecarTask, nomad.EnvoyAdminPort, endpoint)
+}
+
+func captureTcpdump(nomadService nomad.NomadApiService, config SnapshotConfig) ([]byte, error) {
+	// Run tcpdump via exec in the sidecar task
+	// This requires tcpdump to be available in the sidecar image
+	durationSecs := int(config.Duration.Seconds())
+	if durationSecs < 5 {
+		durationSecs = 5
+	}
+
+	// Capture traffic and base64 encode it for transport
+	cmd := []string{
 		"sh", "-c",
-		fmt.Sprintf("curl -s http://127.0.0.1:%d%s", podPort, endpoint),
+		fmt.Sprintf("timeout %d tcpdump -i any -s0 -w - 2>/dev/null | base64", durationSecs),
 	}
 
-	err := kubeService.RunEphemeralInTargetNetNSWithOutput(
-		pod,
-		container, // any container in the pod (shares netns)
-		curlCmd,
-		false,          // not privileged
-		15*time.Second, // timeout
-		&buf,           // capture stdout
-		nil,            // ignore stderr
-	)
-	if err == nil && buf.Len() > 0 {
-		log.Printf("Fetched %s from pod %s via ephemeral curl", endpoint, pod)
-		return buf.Bytes(), nil
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	log.Printf("Running tcpdump for %d seconds in task %s", durationSecs, config.SidecarTask)
+
+	_, err := nomadService.ExecuteCommandWithStderr(config.AllocID, config.SidecarTask, cmd, &stdout, &stderr)
+	if err != nil {
+		// Check if tcpdump is not available
+		if strings.Contains(stderr.String(), "not found") || strings.Contains(err.Error(), "not found") {
+			return nil, fmt.Errorf("tcpdump not available in sidecar image")
+		}
+		return nil, fmt.Errorf("tcpdump failed: %w (stderr: %s)", err, stderr.String())
 	}
 
-	return nil, fmt.Errorf("port-forward and ephemeral curl both failed for %s", endpoint)
+	if stdout.Len() == 0 {
+		log.Printf("No tcpdump data captured")
+		return nil, nil
+	}
+
+	// Decode base64
+	raw := stdout.String()
+	clean := regexp.MustCompile(`[^A-Za-z0-9+/=]`).ReplaceAllString(strings.TrimSpace(raw), "")
+	if clean == "" {
+		return nil, nil
+	}
+
+	data, err := base64.StdEncoding.DecodeString(clean)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode base64 tcpdump stream: %w", err)
+	}
+
+	return data, nil
 }
 
 func createTarGz(outputFile string, sourceDir string) error {
