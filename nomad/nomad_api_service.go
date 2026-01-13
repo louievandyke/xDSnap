@@ -16,7 +16,7 @@ import (
 	nomadapi "github.com/hashicorp/nomad/api"
 )
 
-const EnvoyAdminPort = 19000
+const EnvoyAdminPort = 19001
 
 // AllocationInfo contains information about a Nomad allocation running Consul Connect
 type AllocationInfo struct {
@@ -439,28 +439,44 @@ func (n *NomadApiServiceImpl) EnvoyAdminPOST(allocIP string, port int, path stri
 }
 
 // EnvoyAdminGETViaExec makes a GET request to Envoy admin via exec (fallback)
+// Uses bash /dev/tcp since curl is not available in standard Envoy images
+// Consul Connect binds Envoy admin to 127.0.0.2 (not 127.0.0.1)
 func (n *NomadApiServiceImpl) EnvoyAdminGETViaExec(allocID, task string, port int, path string) ([]byte, error) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	cmd := []string{"sh", "-c", fmt.Sprintf("curl -s http://127.0.0.1:%d%s", port, path)}
+	// Use bash /dev/tcp with HTTP/1.1 (required by Envoy admin)
+	// Consul Connect configures Envoy admin on 127.0.0.2
+	bashCmd := fmt.Sprintf(`exec 3<>/dev/tcp/127.0.0.2/%d; echo -e "GET %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3; cat <&3`, port, path)
+	cmd := []string{"bash", "-c", bashCmd}
 	_, err := n.ExecuteCommandWithStderr(allocID, task, cmd, &stdout, &stderr)
 	if err != nil {
-		return nil, fmt.Errorf("exec curl failed: %w (stderr: %s)", err, stderr.String())
+		return nil, fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
 	}
 
-	return stdout.Bytes(), nil
+	// Strip HTTP headers from response
+	body := stdout.Bytes()
+	if idx := bytes.Index(body, []byte("\r\n\r\n")); idx != -1 {
+		body = body[idx+4:]
+	}
+
+	return body, nil
 }
 
 // EnvoyAdminPOSTViaExec makes a POST request to Envoy admin via exec (fallback)
+// Uses bash /dev/tcp since curl is not available in standard Envoy images
+// Consul Connect binds Envoy admin to 127.0.0.2 (not 127.0.0.1)
 func (n *NomadApiServiceImpl) EnvoyAdminPOSTViaExec(allocID, task string, port int, path string) error {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	cmd := []string{"sh", "-c", fmt.Sprintf("curl -s -X POST http://127.0.0.1:%d%s", port, path)}
+	// Use bash /dev/tcp with HTTP/1.1 (required by Envoy admin)
+	// Consul Connect configures Envoy admin on 127.0.0.2
+	bashCmd := fmt.Sprintf(`exec 3<>/dev/tcp/127.0.0.2/%d; echo -e "POST %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n" >&3; cat <&3`, port, path)
+	cmd := []string{"bash", "-c", bashCmd}
 	_, err := n.ExecuteCommandWithStderr(allocID, task, cmd, &stdout, &stderr)
 	if err != nil {
-		return fmt.Errorf("exec curl failed: %w (stderr: %s)", err, stderr.String())
+		return fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
 	}
 
 	return nil
