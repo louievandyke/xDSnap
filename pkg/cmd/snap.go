@@ -20,7 +20,6 @@ import (
 
 type SnapshotConfig struct {
 	AllocID           string
-	AllocIP           string
 	TaskName          string
 	SidecarTask       string
 	Endpoints         []string
@@ -197,40 +196,11 @@ func streamLogsToFiles(nomadService nomad.NomadApiService, allocID, task string,
 }
 
 func setEnvoyLogLevel(nomadService nomad.NomadApiService, config SnapshotConfig, level string) error {
-	// Try direct HTTP first if we have an IP
-	if config.AllocIP != "" {
-		path := fmt.Sprintf("/logging?level=%s", level)
-		err := nomadService.EnvoyAdminPOST(config.AllocIP, nomad.EnvoyAdminPort, path)
-		if err == nil {
-			return nil
-		}
-		log.Printf("Direct HTTP failed, falling back to exec: %v", err)
-	}
-
-	// Fallback to exec
 	path := fmt.Sprintf("/logging?level=%s", level)
 	return nomadService.EnvoyAdminPOSTViaExec(config.AllocID, config.SidecarTask, nomad.EnvoyAdminPort, path)
 }
 
 func fetchEnvoyEndpoint(nomadService nomad.NomadApiService, config SnapshotConfig, endpoint string) ([]byte, error) {
-	const maxRetries = 3
-	const retryDelay = 2 * time.Second
-
-	// Try direct HTTP first if we have an IP
-	if config.AllocIP != "" {
-		for i := 0; i < maxRetries; i++ {
-			data, err := nomadService.EnvoyAdminGET(config.AllocIP, nomad.EnvoyAdminPort, endpoint)
-			if err == nil && len(data) > 0 {
-				return data, nil
-			}
-			if i < maxRetries-1 {
-				time.Sleep(retryDelay)
-			}
-		}
-		log.Printf("Direct HTTP failed for %s, falling back to exec", endpoint)
-	}
-
-	// Fallback to exec
 	return nomadService.EnvoyAdminGETViaExec(config.AllocID, config.SidecarTask, nomad.EnvoyAdminPort, endpoint)
 }
 

@@ -149,7 +149,6 @@ Environment variables:
 
 					snapshotConfig := SnapshotConfig{
 						AllocID:           alloc.ID,
-						AllocIP:           alloc.IP,
 						TaskName:          targetTask,
 						SidecarTask:       alloc.SidecarTask,
 						Endpoints:         endpoints,

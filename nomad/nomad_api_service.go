@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -27,7 +26,6 @@ type AllocationInfo struct {
 	TaskGroup   string
 	Namespace   string
 	NodeID      string
-	IP          string
 	Tasks       []string
 	SidecarTask string // detected envoy/connect-proxy task
 }
@@ -43,18 +41,13 @@ type NomadApiService interface {
 
 	// Discovery
 	ListTasks(allocID string) ([]string, error)
-	GetAllocationIP(allocID string) (string, error)
 	GetAllocation(allocID string) (*AllocationInfo, error)
 
 	// Consul Integration
 	FindConnectAllocations(namespace string) ([]AllocationInfo, error)
 	FindConnectAllocationsByService(namespace, serviceName string) ([]AllocationInfo, error)
 
-	// HTTP requests to Envoy (direct IP access)
-	EnvoyAdminGET(allocIP string, port int, path string) ([]byte, error)
-	EnvoyAdminPOST(allocIP string, port int, path string) error
-
-	// Exec-based Envoy access (fallback when direct IP not reachable)
+	// Exec-based Envoy admin access (via nomad alloc exec)
 	EnvoyAdminGETViaExec(allocID, task string, port int, path string) ([]byte, error)
 	EnvoyAdminPOSTViaExec(allocID, task string, port int, path string) error
 }
@@ -235,34 +228,6 @@ func (n *NomadApiServiceImpl) ListTasks(allocID string) ([]string, error) {
 	return tasks, nil
 }
 
-// GetAllocationIP returns the IP address of an allocation
-func (n *NomadApiServiceImpl) GetAllocationIP(allocID string) (string, error) {
-	alloc, _, err := n.nomadClient.Allocations().Info(allocID, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to get allocation info: %w", err)
-	}
-
-	// Try to get the allocation's network IP
-	if alloc.AllocatedResources != nil && alloc.AllocatedResources.Shared.Networks != nil {
-		for _, network := range alloc.AllocatedResources.Shared.Networks {
-			if network.IP != "" {
-				return network.IP, nil
-			}
-		}
-	}
-
-	// Fallback: try to get from task resources
-	for _, resources := range alloc.AllocatedResources.Tasks {
-		for _, network := range resources.Networks {
-			if network.IP != "" {
-				return network.IP, nil
-			}
-		}
-	}
-
-	return "", fmt.Errorf("no IP address found for allocation %s", allocID)
-}
-
 // GetAllocation returns detailed information about an allocation
 func (n *NomadApiServiceImpl) GetAllocation(allocID string) (*AllocationInfo, error) {
 	alloc, _, err := n.nomadClient.Allocations().Info(allocID, nil)
@@ -286,9 +251,6 @@ func (n *NomadApiServiceImpl) GetAllocation(allocID string) (*AllocationInfo, er
 
 	// Detect sidecar task
 	info.SidecarTask = detectSidecarTask(info.Tasks)
-
-	// Get IP
-	info.IP, _ = n.GetAllocationIP(allocID)
 
 	return info, nil
 }
@@ -408,49 +370,7 @@ func (n *NomadApiServiceImpl) scanNomadForConnectAllocations(namespace string) (
 	return results, nil
 }
 
-// EnvoyAdminGET makes a GET request to the Envoy admin API via direct IP
-func (n *NomadApiServiceImpl) EnvoyAdminGET(allocIP string, port int, path string) ([]byte, error) {
-	url := fmt.Sprintf("http://%s:%d%s", allocIP, port, path)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("GET %s failed: %w", url, err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("GET %s returned %d: %s", path, resp.StatusCode, string(body))
-	}
-
-	return body, nil
-}
-
-// EnvoyAdminPOST makes a POST request to the Envoy admin API via direct IP
-func (n *NomadApiServiceImpl) EnvoyAdminPOST(allocIP string, port int, path string) error {
-	url := fmt.Sprintf("http://%s:%d%s", allocIP, port, path)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Post(url, "application/json", nil)
-	if err != nil {
-		return fmt.Errorf("POST %s failed: %w", url, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("POST %s returned %d: %s", path, resp.StatusCode, string(body))
-	}
-
-	return nil
-}
-
-// EnvoyAdminGETViaExec makes a GET request to Envoy admin via exec (fallback)
+// EnvoyAdminGETViaExec makes a GET request to Envoy admin via exec
 // Uses bash /dev/tcp since curl is not available in standard Envoy images
 // Consul Connect binds Envoy admin to 127.0.0.2 (not 127.0.0.1)
 func (n *NomadApiServiceImpl) EnvoyAdminGETViaExec(allocID, task string, port int, path string) ([]byte, error) {
@@ -529,7 +449,7 @@ func decodeChunked(data []byte) []byte {
 	return result.Bytes()
 }
 
-// EnvoyAdminPOSTViaExec makes a POST request to Envoy admin via exec (fallback)
+// EnvoyAdminPOSTViaExec makes a POST request to Envoy admin via exec
 // Uses bash /dev/tcp since curl is not available in standard Envoy images
 // Consul Connect binds Envoy admin to 127.0.0.2 (not 127.0.0.1)
 func (n *NomadApiServiceImpl) EnvoyAdminPOSTViaExec(allocID, task string, port int, path string) error {

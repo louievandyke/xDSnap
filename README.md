@@ -168,7 +168,7 @@ xdsnap capture --service web
 ### Notes
 
 - The tool queries Consul to discover services with Connect sidecar proxies, then maps them to Nomad allocations.
-- Direct HTTP access to allocation IPs is attempted first; if unreachable, the tool falls back to `nomad alloc exec` with curl.
+- The tool uses `nomad alloc exec` to access the Envoy admin API (Consul Connect binds it to 127.0.0.2 inside the container).
 - When `--tcpdump` is enabled, the tool executes tcpdump inside the sidecar task. The resulting `.pcap` file is included in the snapshot archive.
 - `--repeat` controls the number of capture cycles. `--duration` enforces a timeout for the entire session.
 - The tool automatically detects sidecar tasks (e.g., `connect-proxy-*`, `envoy-sidecar`, `consul-dataplane`).
