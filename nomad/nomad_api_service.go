@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -134,13 +135,16 @@ func (n *NomadApiServiceImpl) ExecuteCommandWithStderr(allocID, task string, com
 		return -1, fmt.Errorf("failed to get allocation info: %w", err)
 	}
 
+	// Use an empty reader for stdin - passing nil causes panic in Nomad API
+	emptyStdin := bytes.NewReader(nil)
+
 	exitCode, err := n.nomadClient.Allocations().Exec(
 		ctx,
 		alloc,
 		task,
 		false, // tty
 		command,
-		nil,    // stdin
+		emptyStdin,
 		stdout,
 		stderr,
 		sizeCh,
@@ -162,18 +166,26 @@ func (n *NomadApiServiceImpl) FetchTaskLogs(ctx context.Context, allocID, task s
 
 	// Create a cancel channel from context
 	cancel := make(chan struct{})
+	var closeOnce sync.Once
+	safeClose := func() {
+		closeOnce.Do(func() {
+			close(cancel)
+		})
+	}
+
 	go func() {
 		<-ctx.Done()
-		close(cancel)
+		safeClose()
 	}()
 
 	// Also handle OS signals
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 	go func() {
 		select {
 		case <-sigCh:
-			close(cancel)
+			safeClose()
 		case <-ctx.Done():
 		}
 	}()
@@ -460,7 +472,61 @@ func (n *NomadApiServiceImpl) EnvoyAdminGETViaExec(allocID, task string, port in
 		body = body[idx+4:]
 	}
 
+	// Decode chunked transfer encoding if present
+	body = decodeChunked(body)
+
 	return body, nil
+}
+
+// decodeChunked decodes HTTP chunked transfer encoding
+// Format: <hex-size>\r\n<data>\r\n ... 0\r\n\r\n
+func decodeChunked(data []byte) []byte {
+	var result bytes.Buffer
+	remaining := data
+
+	for len(remaining) > 0 {
+		// Find the chunk size line
+		idx := bytes.Index(remaining, []byte("\r\n"))
+		if idx == -1 {
+			// No more chunk headers, return what we have
+			result.Write(remaining)
+			break
+		}
+
+		// Parse hex chunk size
+		sizeHex := string(bytes.TrimSpace(remaining[:idx]))
+		var chunkSize int64
+		_, err := fmt.Sscanf(sizeHex, "%x", &chunkSize)
+		if err != nil {
+			// Not valid chunked encoding, return original data
+			return data
+		}
+
+		// Move past the size line
+		remaining = remaining[idx+2:]
+
+		// Zero chunk size means end of data
+		if chunkSize == 0 {
+			break
+		}
+
+		// Read the chunk data
+		if int64(len(remaining)) < chunkSize {
+			// Not enough data, take what we have
+			result.Write(remaining)
+			break
+		}
+
+		result.Write(remaining[:chunkSize])
+		remaining = remaining[chunkSize:]
+
+		// Skip trailing \r\n after chunk data
+		if len(remaining) >= 2 && remaining[0] == '\r' && remaining[1] == '\n' {
+			remaining = remaining[2:]
+		}
+	}
+
+	return result.Bytes()
 }
 
 // EnvoyAdminPOSTViaExec makes a POST request to Envoy admin via exec (fallback)

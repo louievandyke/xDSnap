@@ -67,14 +67,10 @@ func CaptureSnapshot(nomadService nomad.NomadApiService, config SnapshotConfig) 
 		task := task
 		go func() {
 			log.Printf("Starting log stream for task %s", task)
-			logBytes, err := streamLogsWithTimeout(nomadService, config.AllocID, task, config.Duration+10*time.Second)
-			if err != nil {
+			stdoutPath := filepath.Join(tempDir, fmt.Sprintf("%s-stdout.log", task))
+			stderrPath := filepath.Join(tempDir, fmt.Sprintf("%s-stderr.log", task))
+			if err := streamLogsToFiles(nomadService, config.AllocID, task, config.Duration+10*time.Second, stdoutPath, stderrPath); err != nil {
 				log.Printf("Failed to stream logs for task %s: %v", task, err)
-			} else {
-				logsPath := filepath.Join(tempDir, fmt.Sprintf("%s-logs.txt", task))
-				if err := os.WriteFile(logsPath, logBytes, 0644); err != nil {
-					log.Printf("Failed to write logs for task %s: %v", task, err)
-				}
 			}
 			logResults <- struct{}{}
 		}()
@@ -149,40 +145,55 @@ func CaptureSnapshot(nomadService nomad.NomadApiService, config SnapshotConfig) 
 	return nil
 }
 
-func streamLogsWithTimeout(nomadService nomad.NomadApiService, allocID, task string, duration time.Duration) ([]byte, error) {
-	var logsBuf bytes.Buffer
+func streamLogsToFiles(nomadService nomad.NomadApiService, allocID, task string, duration time.Duration, stdoutPath, stderrPath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 
-	// Stream both stdout and stderr
+	// Create output files
+	stdoutFile, err := os.Create(stdoutPath)
+	if err != nil {
+		return fmt.Errorf("failed to create stdout file: %w", err)
+	}
+	defer stdoutFile.Close()
+
+	stderrFile, err := os.Create(stderrPath)
+	if err != nil {
+		return fmt.Errorf("failed to create stderr file: %w", err)
+	}
+	defer stderrFile.Close()
+
+	// Stream both stdout and stderr to separate files
 	done := make(chan error, 2)
 
 	go func() {
-		done <- nomadService.FetchTaskLogs(ctx, allocID, task, "stdout", true, &logsBuf)
+		done <- nomadService.FetchTaskLogs(ctx, allocID, task, "stdout", true, stdoutFile)
 	}()
 
 	go func() {
-		var stderrBuf bytes.Buffer
-		err := nomadService.FetchTaskLogs(ctx, allocID, task, "stderr", true, &stderrBuf)
-		if err == nil && stderrBuf.Len() > 0 {
-			logsBuf.WriteString("\n--- STDERR ---\n")
-			logsBuf.Write(stderrBuf.Bytes())
-		}
-		done <- err
+		done <- nomadService.FetchTaskLogs(ctx, allocID, task, "stderr", true, stderrFile)
 	}()
 
-	// Wait for context or completion
-	select {
-	case <-ctx.Done():
-		return logsBuf.Bytes(), nil
-	case err := <-done:
-		// Wait for the second goroutine too
+	// Wait for context timeout or both streams to complete
+	var firstErr error
+	for i := 0; i < 2; i++ {
 		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
+		case err := <-done:
+			if err != nil && firstErr == nil && err != context.DeadlineExceeded {
+				firstErr = err
+			}
+		case <-ctx.Done():
+			// Context timed out, wait briefly for goroutines to notice
+			for j := i; j < 2; j++ {
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+				}
+			}
+			return firstErr
 		}
-		return logsBuf.Bytes(), err
 	}
+
+	return firstErr
 }
 
 func setEnvoyLogLevel(nomadService nomad.NomadApiService, config SnapshotConfig, level string) error {
