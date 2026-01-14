@@ -1,0 +1,55 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "perk/ubuntu-2204-arm64"
+  config.vm.hostname = "nomad-connect"
+
+  # Forward ports for UIs
+  config.vm.network "forwarded_port", guest: 4646, host: 4646  # Nomad
+  config.vm.network "forwarded_port", guest: 8500, host: 8500  # Consul
+  config.vm.network "forwarded_port", guest: 9002, host: 9002  # Count Dashboard
+
+  config.vm.provider "qemu" do |qe|
+    qe.memory = "2G"
+    qe.smp = 2
+    qe.arch = "aarch64"
+    qe.machine = "virt,accel=hvf,highmem=on"
+    qe.cpu = "host"
+    qe.net_device = "virtio-net-pci"
+  end
+
+  config.vm.provision "shell", inline: <<-SHELL
+    set -e
+
+    echo "=== Installing dependencies ==="
+    apt-get update
+    apt-get install -y curl gnupg lsb-release ca-certificates
+
+    echo "=== Installing Docker ==="
+    curl -fsSL https://get.docker.com | sh
+    usermod -aG docker vagrant
+
+    echo "=== Installing HashiCorp tools ==="
+    rm -f /usr/share/keyrings/hashicorp-archive-keyring.gpg
+    curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --batch --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+    echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" > /etc/apt/sources.list.d/hashicorp.list
+    apt-get update
+    apt-get install -y consul nomad
+
+    echo "=== Installing CNI plugins ==="
+    CNI_VERSION="v1.3.0"
+    ARCH="arm64"
+    curl -L -o cni-plugins.tgz "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-${ARCH}-${CNI_VERSION}.tgz"
+    mkdir -p /opt/cni/bin
+    tar -C /opt/cni/bin -xzf cni-plugins.tgz
+    rm cni-plugins.tgz
+
+    echo "=== Setup complete ==="
+    echo "Consul version: $(consul version | head -1)"
+    echo "Nomad version: $(nomad version)"
+  SHELL
+
+  # Sync the demo folder using rsync (SMB requires auth prompts)
+  config.vm.synced_folder ".", "/vagrant", type: "rsync"
+end
