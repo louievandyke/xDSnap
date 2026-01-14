@@ -10,6 +10,7 @@ xDSnap is a CLI tool to capture and organize Envoy configuration snapshots from 
 - [Usage](#usage)
 - [Examples](#examples)
 - [Configuration](#configuration)
+- [Demo](#demo)
 - [Feature Requests](#-feature-requests)
 
 ---
@@ -172,6 +173,38 @@ xdsnap capture --service web
 - When `--tcpdump` is enabled, the tool executes tcpdump inside the sidecar task. The resulting `.pcap` file is included in the snapshot archive.
 - `--repeat` controls the number of capture cycles. `--duration` enforces a timeout for the entire session.
 - The tool automatically detects sidecar tasks (e.g., `connect-proxy-*`, `envoy-sidecar`, `consul-dataplane`).
+
+---
+
+## Demo
+
+A local demo environment is available in the `demo/` folder for testing xDSnap without a production cluster.
+
+### Quick Start
+
+```bash
+# Prerequisites: Vagrant and QEMU
+brew install --cask vagrant
+brew install qemu
+vagrant plugin install vagrant-qemu
+
+# Start the VM
+cd demo
+vagrant up
+vagrant provision
+
+# Start Consul + Nomad (in one terminal)
+vagrant ssh -c "/vagrant/start.sh"
+
+# Deploy sample job (in another terminal)
+vagrant ssh -c "nomad job run /vagrant/countdash.nomad.hcl"
+
+# Run xDSnap from host
+cd ..
+./xdsnap capture --service echo-api
+```
+
+See [demo/README.md](demo/README.md) for full instructions.
 
 ---
 
