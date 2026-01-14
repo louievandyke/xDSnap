@@ -16,7 +16,7 @@ This folder contains a Vagrant setup to run Consul Connect + Nomad for testing x
 
 ```bash
 cd demo
-vagrant up
+vagrant up --provision
 ```
 
 This provisions an Ubuntu VM with:
