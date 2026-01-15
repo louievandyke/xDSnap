@@ -190,8 +190,7 @@ vagrant plugin install vagrant-qemu
 
 # Start the VM
 cd demo
-vagrant up
-vagrant provision
+vagrant up --provision
 
 # Start Consul + Nomad (in one terminal)
 vagrant ssh -c "/vagrant/start.sh"
