@@ -41,28 +41,28 @@ In a new terminal:
 
 ```bash
 cd demo
-vagrant ssh -c "nomad job run /vagrant/countdash.nomad.hcl"
+vagrant ssh -c "nomad job run /vagrant/echo.nomad.hcl"
 ```
 
 This deploys two services connected via Consul service mesh:
-- `count-api` - Backend service
-- `count-dashboard` - Frontend (http://localhost:9002)
+- `echo-api` - Backend echo server
+- `echo-client` - Frontend that calls the backend (http://localhost:9002)
 
 ### 4. Verify deployment
 
 ```bash
 # Check job status
-vagrant ssh -c "nomad job status countdash"
+vagrant ssh -c "nomad job status echo"
 
 # Check Consul services
 vagrant ssh -c "consul catalog services"
 ```
 
 You should see:
-- `count-api`
-- `count-api-sidecar-proxy`
-- `count-dashboard`
-- `count-dashboard-sidecar-proxy`
+- `echo-api`
+- `echo-api-sidecar-proxy`
+- `echo-client`
+- `echo-client-sidecar-proxy`
 
 ### 5. Capture Envoy snapshots with xDSnap
 
@@ -77,10 +77,10 @@ go build -o xdsnap ./cmd/
 ./xdsnap capture
 
 # Capture a specific service
-./xdsnap capture --service count-dashboard
+./xdsnap capture --service echo-client
 
 # Capture with trace logging
-./xdsnap capture --service count-api --enable-trace --duration 30
+./xdsnap capture --service echo-api --enable-trace --duration 30
 ```
 
 ## Cleanup
@@ -105,7 +105,7 @@ vagrant halt
 Make sure the job is running and healthy:
 
 ```bash
-vagrant ssh -c "nomad job status countdash"
+vagrant ssh -c "nomad job status echo"
 ```
 
 ### Connection refused
