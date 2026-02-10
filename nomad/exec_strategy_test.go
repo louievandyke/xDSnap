@@ -108,6 +108,8 @@ func TestHTTPMethodString(t *testing.T) {
 	}{
 		{MethodCurl, "curl"},
 		{MethodWget, "wget"},
+		{MethodPython3, "python3"},
+		{MethodNode, "node"},
 		{MethodBashTCP, "bash"},
 		{HTTPMethod(99), "unknown"},
 	}
@@ -139,6 +141,24 @@ func TestBuildGETCommand(t *testing.T) {
 			port:   19001,
 			path:   "/config_dump",
 			want:   []string{"wget", "-qO-", "http://127.0.0.2:19001/config_dump"},
+		},
+		{
+			name:   "python3",
+			method: MethodPython3,
+			port:   19001,
+			path:   "/stats",
+			want: []string{"python3", "-c",
+				`import urllib.request,sys;sys.stdout.buffer.write(urllib.request.urlopen("http://127.0.0.2:19001/stats").read())`,
+			},
+		},
+		{
+			name:   "node",
+			method: MethodNode,
+			port:   19001,
+			path:   "/config_dump",
+			want: []string{"node", "-e",
+				`var http=require("http");http.get("http://127.0.0.2:19001/config_dump",function(r){var d=[];r.on("data",function(c){d.push(c)});r.on("end",function(){process.stdout.write(Buffer.concat(d))})}).on("error",function(){process.exit(1)})`,
+			},
 		},
 		{
 			name:   "bash",
@@ -199,6 +219,24 @@ func TestBuildPOSTCommand(t *testing.T) {
 			port:   19001,
 			path:   "/logging?level=debug",
 			want:   []string{"wget", "-qO-", "--post-data=", "http://127.0.0.2:19001/logging?level=debug"},
+		},
+		{
+			name:   "python3",
+			method: MethodPython3,
+			port:   19001,
+			path:   "/logging?level=debug",
+			want: []string{"python3", "-c",
+				`import urllib.request;urllib.request.urlopen(urllib.request.Request("http://127.0.0.2:19001/logging?level=debug",data=b"",method="POST"))`,
+			},
+		},
+		{
+			name:   "node",
+			method: MethodNode,
+			port:   19001,
+			path:   "/logging?level=debug",
+			want: []string{"node", "-e",
+				`var http=require("http");var r=http.request({hostname:"127.0.0.2",port:19001,path:"/logging?level=debug",method:"POST"},function(res){res.resume()});r.on("error",function(){process.exit(1)});r.end()`,
+			},
 		},
 		{
 			name:   "bash",
@@ -273,6 +311,35 @@ func TestProbeHTTPCapability(t *testing.T) {
 				"proxy:bash": {exitCode: 0, stdout: "ok\n"},
 			},
 			wantMethod: MethodBashTCP,
+			wantOK:     true,
+		},
+		{
+			name: "only python3 available",
+			task: "app",
+			responses: map[string]mockExecResponse{
+				"app:python3": {exitCode: 0, stdout: "Python 3.11.0"},
+			},
+			wantMethod: MethodPython3,
+			wantOK:     true,
+		},
+		{
+			name: "only node available",
+			task: "app",
+			responses: map[string]mockExecResponse{
+				"app:node": {exitCode: 0, stdout: "v18.0.0"},
+			},
+			wantMethod: MethodNode,
+			wantOK:     true,
+		},
+		{
+			name: "python3 preferred over node when no curl/wget",
+			task: "app",
+			responses: map[string]mockExecResponse{
+				"app:python3": {exitCode: 0, stdout: "Python 3.11.0"},
+				"app:node":    {exitCode: 0, stdout: "v18.0.0"},
+				"app:bash":    {exitCode: 0, stdout: "ok\n"},
+			},
+			wantMethod: MethodPython3,
 			wantOK:     true,
 		},
 		{
@@ -366,6 +433,15 @@ func TestResolveExecStrategy(t *testing.T) {
 			},
 			wantTask:   "web",
 			wantMethod: MethodWget,
+		},
+		{
+			name:      "sidecar distroless, sibling has node",
+			taskOrder: []string{"connect-proxy-web", "web"},
+			responses: map[string]mockExecResponse{
+				"web:node": {exitCode: 0, stdout: "v18.0.0"},
+			},
+			wantTask:   "web",
+			wantMethod: MethodNode,
 		},
 		{
 			name:      "all tasks distroless",

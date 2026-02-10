@@ -13,6 +13,8 @@ type HTTPMethod int
 const (
 	MethodCurl    HTTPMethod = iota // curl -s
 	MethodWget                      // wget -qO-
+	MethodPython3                   // python3 urllib
+	MethodNode                      // node http
 	MethodBashTCP                   // bash /dev/tcp
 )
 
@@ -22,6 +24,10 @@ func (m HTTPMethod) String() string {
 		return "curl"
 	case MethodWget:
 		return "wget"
+	case MethodPython3:
+		return "python3"
+	case MethodNode:
+		return "node"
 	case MethodBashTCP:
 		return "bash"
 	default:
@@ -42,6 +48,8 @@ var probeCommands = []struct {
 }{
 	{MethodCurl, []string{"curl", "--version"}},
 	{MethodWget, []string{"wget", "--version"}},
+	{MethodPython3, []string{"python3", "--version"}},
+	{MethodNode, []string{"node", "--version"}},
 	{MethodBashTCP, []string{"bash", "-c", "echo ok"}},
 }
 
@@ -79,7 +87,7 @@ func ResolveExecStrategy(svc NomadApiService, allocID string, taskOrder []string
 	}
 
 	return nil, fmt.Errorf(
-		"no HTTP tool found in any task for allocation %s\n  Tried: %s\n  Hint: ensure curl, wget, or bash is available in at least one task",
+		"no HTTP tool found in any task for allocation %s\n  Tried: %s\n  Hint: ensure curl, wget, python3, node, or bash is available in at least one task",
 		allocID[:8],
 		strings.Join(tried, ", "),
 	)
@@ -92,6 +100,12 @@ func BuildGETCommand(method HTTPMethod, port int, path string) []string {
 		return []string{"curl", "-s", fmt.Sprintf("http://127.0.0.2:%d%s", port, path)}
 	case MethodWget:
 		return []string{"wget", "-qO-", fmt.Sprintf("http://127.0.0.2:%d%s", port, path)}
+	case MethodPython3:
+		return []string{"python3", "-c",
+			fmt.Sprintf(`import urllib.request,sys;sys.stdout.buffer.write(urllib.request.urlopen("http://127.0.0.2:%d%s").read())`, port, path)}
+	case MethodNode:
+		return []string{"node", "-e",
+			fmt.Sprintf(`var http=require("http");http.get("http://127.0.0.2:%d%s",function(r){var d=[];r.on("data",function(c){d.push(c)});r.on("end",function(){process.stdout.write(Buffer.concat(d))})}).on("error",function(){process.exit(1)})`, port, path)}
 	case MethodBashTCP:
 		bashCmd := fmt.Sprintf(
 			`exec 3<>/dev/tcp/127.0.0.2/%d; echo -e "GET %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3; cat <&3`,
@@ -110,6 +124,12 @@ func BuildPOSTCommand(method HTTPMethod, port int, path string) []string {
 		return []string{"curl", "-s", "-X", "POST", fmt.Sprintf("http://127.0.0.2:%d%s", port, path)}
 	case MethodWget:
 		return []string{"wget", "-qO-", "--post-data=", fmt.Sprintf("http://127.0.0.2:%d%s", port, path)}
+	case MethodPython3:
+		return []string{"python3", "-c",
+			fmt.Sprintf(`import urllib.request;urllib.request.urlopen(urllib.request.Request("http://127.0.0.2:%d%s",data=b"",method="POST"))`, port, path)}
+	case MethodNode:
+		return []string{"node", "-e",
+			fmt.Sprintf(`var http=require("http");var r=http.request({hostname:"127.0.0.2",port:%d,path:"%s",method:"POST"},function(res){res.resume()});r.on("error",function(){process.exit(1)});r.end()`, port, path)}
 	case MethodBashTCP:
 		bashCmd := fmt.Sprintf(
 			`exec 3<>/dev/tcp/127.0.0.2/%d; echo -e "POST %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n" >&3; cat <&3`,
