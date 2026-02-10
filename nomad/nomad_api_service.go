@@ -50,6 +50,10 @@ type NomadApiService interface {
 	// Exec-based Envoy admin access (via nomad alloc exec)
 	EnvoyAdminGETViaExec(allocID, task string, port int, path string) ([]byte, error)
 	EnvoyAdminPOSTViaExec(allocID, task string, port int, path string) error
+
+	// Strategy-aware Envoy admin access (supports curl/wget/bash fallback)
+	EnvoyAdminGET(allocID string, strategy *ExecStrategy, port int, path string) ([]byte, error)
+	EnvoyAdminPOST(allocID string, strategy *ExecStrategy, port int, path string) error
 }
 
 // NomadApiServiceImpl implements NomadApiService
@@ -461,6 +465,50 @@ func (n *NomadApiServiceImpl) EnvoyAdminPOSTViaExec(allocID, task string, port i
 	bashCmd := fmt.Sprintf(`exec 3<>/dev/tcp/127.0.0.2/%d; echo -e "POST %s HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n" >&3; cat <&3`, port, path)
 	cmd := []string{"bash", "-c", bashCmd}
 	_, err := n.ExecuteCommandWithStderr(allocID, task, cmd, &stdout, &stderr)
+	if err != nil {
+		return fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
+	}
+
+	return nil
+}
+
+// EnvoyAdminGET makes a GET request to Envoy admin using the resolved strategy.
+// For curl/wget the response is the body directly; for bash /dev/tcp we strip
+// HTTP headers and decode chunked transfer encoding.
+func (n *NomadApiServiceImpl) EnvoyAdminGET(allocID string, strategy *ExecStrategy, port int, path string) ([]byte, error) {
+	cmd := BuildGETCommand(strategy.Method, port, path)
+	if cmd == nil {
+		return nil, fmt.Errorf("unsupported HTTP method: %v", strategy.Method)
+	}
+
+	var stdout, stderr bytes.Buffer
+	_, err := n.ExecuteCommandWithStderr(allocID, strategy.Task, cmd, &stdout, &stderr)
+	if err != nil {
+		return nil, fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
+	}
+
+	body := stdout.Bytes()
+
+	// Only bash /dev/tcp returns raw HTTP with headers
+	if strategy.Method == MethodBashTCP {
+		if idx := bytes.Index(body, []byte("\r\n\r\n")); idx != -1 {
+			body = body[idx+4:]
+		}
+		body = decodeChunked(body)
+	}
+
+	return body, nil
+}
+
+// EnvoyAdminPOST makes a POST request to Envoy admin using the resolved strategy.
+func (n *NomadApiServiceImpl) EnvoyAdminPOST(allocID string, strategy *ExecStrategy, port int, path string) error {
+	cmd := BuildPOSTCommand(strategy.Method, port, path)
+	if cmd == nil {
+		return fmt.Errorf("unsupported HTTP method: %v", strategy.Method)
+	}
+
+	var stdout, stderr bytes.Buffer
+	_, err := n.ExecuteCommandWithStderr(allocID, strategy.Task, cmd, &stdout, &stderr)
 	if err != nil {
 		return fmt.Errorf("exec failed: %w (stderr: %s)", err, stderr.String())
 	}

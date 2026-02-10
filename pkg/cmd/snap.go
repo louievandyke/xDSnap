@@ -29,6 +29,7 @@ type SnapshotConfig struct {
 	EnableTrace       bool
 	TcpdumpEnabled    bool
 	SkipLogLevelReset bool
+	ExecStrategy      *nomad.ExecStrategy
 }
 
 var DefaultEndpoints = []string{"/stats", "/config_dump", "/listeners", "/clusters", "/certs"}
@@ -40,6 +41,16 @@ func CaptureSnapshot(nomadService nomad.NomadApiService, config SnapshotConfig) 
 
 	log.Printf("CaptureSnapshot called with Alloc=%s Task=%s Sidecar=%s EnableTrace=%v",
 		config.AllocID[:8], config.TaskName, config.SidecarTask, config.EnableTrace)
+
+	// Resolve exec strategy if not already set
+	if config.ExecStrategy == nil {
+		taskOrder := buildTaskOrder(config.SidecarTask, config.TaskName, config.ExtraLogs)
+		strategy, err := nomad.ResolveExecStrategy(nomadService, config.AllocID, taskOrder)
+		if err != nil {
+			return fmt.Errorf("failed to resolve exec strategy: %w", err)
+		}
+		config.ExecStrategy = strategy
+	}
 
 	tempDir, err := os.MkdirTemp("", config.AllocID[:8])
 	if err != nil {
@@ -197,59 +208,85 @@ func streamLogsToFiles(nomadService nomad.NomadApiService, allocID, task string,
 
 func setEnvoyLogLevel(nomadService nomad.NomadApiService, config SnapshotConfig, level string) error {
 	path := fmt.Sprintf("/logging?level=%s", level)
-	return nomadService.EnvoyAdminPOSTViaExec(config.AllocID, config.SidecarTask, nomad.EnvoyAdminPort, path)
+	return nomadService.EnvoyAdminPOST(config.AllocID, config.ExecStrategy, nomad.EnvoyAdminPort, path)
 }
 
 func fetchEnvoyEndpoint(nomadService nomad.NomadApiService, config SnapshotConfig, endpoint string) ([]byte, error) {
-	return nomadService.EnvoyAdminGETViaExec(config.AllocID, config.SidecarTask, nomad.EnvoyAdminPort, endpoint)
+	return nomadService.EnvoyAdminGET(config.AllocID, config.ExecStrategy, nomad.EnvoyAdminPort, endpoint)
 }
 
 func captureTcpdump(nomadService nomad.NomadApiService, config SnapshotConfig) ([]byte, error) {
-	// Run tcpdump via exec in the sidecar task
-	// This requires tcpdump to be available in the sidecar image
 	durationSecs := int(config.Duration.Seconds())
 	if durationSecs < 5 {
 		durationSecs = 5
 	}
 
-	// Capture traffic and base64 encode it for transport
+	// Build task order: sidecar first, then siblings (all share network namespace)
+	tasksToTry := buildTaskOrder(config.SidecarTask, config.TaskName, config.ExtraLogs)
+
 	cmd := []string{
 		"sh", "-c",
 		fmt.Sprintf("timeout %d tcpdump -i any -s0 -w - 2>/dev/null | base64", durationSecs),
 	}
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
+	for _, task := range tasksToTry {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
 
-	log.Printf("Running tcpdump for %d seconds in task %s", durationSecs, config.SidecarTask)
+		log.Printf("Running tcpdump for %d seconds in task %s", durationSecs, task)
 
-	_, err := nomadService.ExecuteCommandWithStderr(config.AllocID, config.SidecarTask, cmd, &stdout, &stderr)
-	if err != nil {
-		// Check if tcpdump is not available
-		if strings.Contains(stderr.String(), "not found") || strings.Contains(err.Error(), "not found") {
-			return nil, fmt.Errorf("tcpdump not available in sidecar image")
+		_, err := nomadService.ExecuteCommandWithStderr(config.AllocID, task, cmd, &stdout, &stderr)
+		if err != nil {
+			if strings.Contains(stderr.String(), "not found") || strings.Contains(err.Error(), "not found") {
+				log.Printf("tcpdump/sh not available in task %q, trying next task...", task)
+				continue
+			}
+			return nil, fmt.Errorf("tcpdump failed in task %q: %w (stderr: %s)", task, err, stderr.String())
 		}
-		return nil, fmt.Errorf("tcpdump failed: %w (stderr: %s)", err, stderr.String())
+
+		if stdout.Len() == 0 {
+			log.Printf("No tcpdump data captured in task %s", task)
+			return nil, nil
+		}
+
+		if task != config.SidecarTask {
+			log.Printf("Captured tcpdump via sibling task %q (shared network namespace)", task)
+		}
+
+		// Decode base64
+		raw := stdout.String()
+		clean := regexp.MustCompile(`[^A-Za-z0-9+/=]`).ReplaceAllString(strings.TrimSpace(raw), "")
+		if clean == "" {
+			return nil, nil
+		}
+
+		data, err := base64.StdEncoding.DecodeString(clean)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode base64 tcpdump stream: %w", err)
+		}
+
+		return data, nil
 	}
 
-	if stdout.Len() == 0 {
-		log.Printf("No tcpdump data captured")
-		return nil, nil
-	}
+	return nil, fmt.Errorf("tcpdump not available in any task (tried: %s)", strings.Join(tasksToTry, ", "))
+}
 
-	// Decode base64
-	raw := stdout.String()
-	clean := regexp.MustCompile(`[^A-Za-z0-9+/=]`).ReplaceAllString(strings.TrimSpace(raw), "")
-	if clean == "" {
-		return nil, nil
+// buildTaskOrder returns a deduplicated list of tasks to try, with sidecar first.
+func buildTaskOrder(sidecarTask, taskName string, extraLogs []string) []string {
+	seen := make(map[string]bool)
+	var order []string
+	add := func(t string) {
+		if t != "" && !seen[t] {
+			seen[t] = true
+			order = append(order, t)
+		}
 	}
-
-	data, err := base64.StdEncoding.DecodeString(clean)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode base64 tcpdump stream: %w", err)
+	add(sidecarTask)
+	add(taskName)
+	for _, t := range extraLogs {
+		add(t)
 	}
-
-	return data, nil
+	return order
 }
 
 func createTarGz(outputFile string, sourceDir string) error {

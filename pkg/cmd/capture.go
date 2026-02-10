@@ -87,6 +87,26 @@ Environment variables:
 				log.Fatalf("Interval must be at least 5 seconds")
 			}
 
+			// Resolve exec strategy once per allocation (reused across repeat iterations)
+			strategyCache := make(map[string]*nomad.ExecStrategy)
+			for _, alloc := range allocsToCapture {
+				if alloc.SidecarTask == "" {
+					continue
+				}
+				taskOrder := []string{alloc.SidecarTask}
+				for _, t := range alloc.Tasks {
+					if t != alloc.SidecarTask {
+						taskOrder = append(taskOrder, t)
+					}
+				}
+				strategy, err := nomad.ResolveExecStrategy(nomadService, alloc.ID, taskOrder)
+				if err != nil {
+					log.Printf("WARNING: %v", err)
+					continue
+				}
+				strategyCache[alloc.ID] = strategy
+			}
+
 			if repeat > 0 {
 				log.Printf("Starting snapshot capture with sleep=%ds repeat=%d trace=%v tcpdump=%v outputDir=%s",
 					interval, repeat, enableTrace, tcpdumpEnabled, outputDir)
@@ -158,6 +178,7 @@ Environment variables:
 						TcpdumpEnabled:    tcpdumpEnabled,
 						Duration:          time.Duration(duration) * time.Second,
 						SkipLogLevelReset: !finalReset,
+						ExecStrategy:      strategyCache[alloc.ID],
 					}
 
 					// Start timer here *after* setup begins
